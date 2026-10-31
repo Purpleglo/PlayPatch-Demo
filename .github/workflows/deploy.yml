@@ -1,5 +1,5 @@
-name: Deploy compiled tester demo
-run-name: Deploy ${{ github.event.release.tag_name || 'latest release' }}
+name: Validate compiled tester release
+run-name: Validate ${{ github.event.release.tag_name || 'latest release' }}
 
 on:
   release:
@@ -8,61 +8,40 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: playpatch-demo-pages
+  group: playpatch-release-validation
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Check out deployment configuration
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Select latest published release
-        id: release
+      - name: Download compiled archive and hosting metadata
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_RELEASE: ${{ github.event.release.tag_name }}
         shell: bash
         run: |
           set -euo pipefail
-          RELEASE_TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
-          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]; then
+          TAG="$EVENT_RELEASE"
+          if [[ -z "$TAG" ]]; then
+            TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]; then
             echo 'Invalid release tag'; exit 1
           fi
-          if [[ -n "$EVENT_RELEASE" && "$EVENT_RELEASE" != "$RELEASE_TAG" ]]; then
-            echo 'A newer release supersedes this event; keeping the current deployment.'
-            echo 'deploy=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "PLAYPATCH_DEPLOY_RELEASE=$RELEASE_TAG" >> "$GITHUB_ENV"
-          echo 'deploy=true' >> "$GITHUB_OUTPUT"
-      - name: Download tested compiled release
-        if: steps.release.outputs.deploy == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          RELEASE_TAG="$PLAYPATCH_DEPLOY_RELEASE"
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern playpatch-demo.zip --dir .download
-      - name: Validate and extract compiled site
-        if: steps.release.outputs.deploy == 'true'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern playpatch-demo.zip --pattern hosting-index.json --pattern release.json --pattern version.json --dir .download
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > .download/release-assets.json
+          echo "PLAYPATCH_VALIDATE_RELEASE=$TAG" >> "$GITHUB_ENV"
+      - name: Validate compiled contents and retained proxy routes
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path, PurePosixPath
-          import json, os, stat, zipfile
+          import hashlib, json, os, re, stat, zipfile
           target = Path('site').resolve()
           target.mkdir()
           allowed = {'assets','releases','index.html','app.js','styles.css','version.json','.nojekyll'}
@@ -74,51 +53,50 @@ jobs:
                   path = PurePosixPath(item.filename)
                   if not path.parts or path.is_absolute() or '..' in path.parts or '\\' in item.filename or path.parts[0] not in allowed:
                       raise SystemExit('Archive contains an unexpected path')
-                  if item.filename in names or stat.S_ISLNK(item.external_attr >> 16):
+                  if item.filename.casefold() in names or stat.S_ISLNK(item.external_attr >> 16):
                       raise SystemExit('Archive contains a duplicate or linked path')
-                  names.add(item.filename)
+                  names.add(item.filename.casefold())
                   if path.suffix.lower() in forbidden or path.name in {'.env','.npmrc','.gitconfig'} or path.name.endswith(('.symbols.json','.map')):
-                      raise SystemExit('Source/debug files are forbidden')
+                      raise SystemExit('Source/debug/private files are forbidden')
                   if item.file_size > 100 * 1024 * 1024:
                       raise SystemExit('Archive file exceeds 100 MiB')
                   total += item.file_size
               if total > 1024 * 1024 * 1024:
                   raise SystemExit('Compiled site exceeds 1 GiB')
               archive.extractall(target)
-          if not all((target / name).is_file() for name in ('index.html','app.js','styles.css','version.json','.nojekyll')):
-              raise SystemExit('Compiled site is incomplete')
+          tag = os.environ['PLAYPATCH_VALIDATE_RELEASE']
           version = json.loads((target / 'version.json').read_text())
-          if version['release'] != os.environ['PLAYPATCH_DEPLOY_RELEASE']:
-              raise SystemExit('Release manifest does not match deployment tag')
-          manifest = target / 'releases' / version['release'] / 'release.json'
-          if json.loads(manifest.read_text())['sourceCommit'] != version['sourceCommit']:
-              raise SystemExit('Release provenance mismatch')
-          print('Validated compiled site:', version['release'], total, 'bytes')
+          index = json.loads(Path('.download/hosting-index.json').read_text())
+          manifest = json.loads(Path('.download/release.json').read_text())
+          if version['release'] != tag or index['release'] != tag or manifest['release'] != tag or index.get('schema') != 1:
+              raise SystemExit('Release identity differs between archive and attachments')
+          if index['sourceCommit'] != version['sourceCommit'] or manifest['sourceCommit'] != version['sourceCommit']:
+              raise SystemExit('Release provenance differs between attachments')
+          if Path('.download/version.json').read_bytes() != (target / 'version.json').read_bytes():
+              raise SystemExit('Public version attachment differs from archive')
+          if Path('.download/release.json').read_bytes() != (target / 'releases' / tag / 'release.json').read_bytes():
+              raise SystemExit('Public manifest attachment differs from archive')
+          remote = json.loads(Path('.download/release-assets.json').read_text())
+          if remote.get('draft'):
+              raise SystemExit('Validation requires an atomically published release')
+          assets = {entry['name']: entry for entry in remote['assets']}
+          for relative, entry in index['files'].items():
+              path = PurePosixPath(relative)
+              if path.is_absolute() or '..' in path.parts or '\\' in relative:
+                  raise SystemExit('Hosting index contains an unbounded route')
+              if relative not in {'index.html','app.js','styles.css','version.json'} and not (relative.startswith('assets/') or (len(path.parts) == 3 and path.parts[0] == 'releases' and path.name == 'release.json')):
+                  raise SystemExit('Hosting route escaped compiled site')
+              file = target / relative
+              if not file.is_file() or file.stat().st_size != entry['bytes']:
+                  raise SystemExit('Retained hosting route is missing from compiled archive')
+              digest = hashlib.file_digest(file.open('rb'), 'sha256').hexdigest()
+              if digest != entry['sha256']:
+                  raise SystemExit('Hosting route digest differs from compiled archive')
+              if relative.startswith('assets/') and entry['asset'] != 'asset-' + digest:
+                  raise SystemExit('Compiled asset attachment lacks its content address')
+              if entry['release'] == tag:
+                  asset = assets.get(entry['asset'])
+                  if not asset or asset['state'] != 'uploaded' or asset['size'] != entry['bytes'] or (asset.get('digest') and asset['digest'] != 'sha256:' + digest):
+                      raise SystemExit('Current release attachment does not match tested bytes')
+          print('Validated compiled release and retained hosting routes:', tag, total, 'bytes')
           PY
-      - name: Configure Pages
-        if: steps.release.outputs.deploy == 'true'
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
-      - name: Upload compiled Pages artifact
-        if: steps.release.outputs.deploy == 'true'
-        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
-        with:
-          path: site
-      - name: Recheck latest immediately before deployment
-        id: still_latest
-        if: steps.release.outputs.deploy == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          CURRENT="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
-          if [[ "$CURRENT" != "$PLAYPATCH_DEPLOY_RELEASE" ]]; then
-            echo 'A newer release was published during preparation; skipping stale deployment.'
-            echo 'deploy=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'deploy=true' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Deploy Pages
-        id: deployment
-        if: steps.still_latest.outputs.deploy == 'true'
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
